@@ -253,38 +253,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.1/Libavcodec.xcframework.zip",
-            checksum: "cab6248dddf51e59c24622d69d28fa92fcaa46c7766f5db19ce852872f2d2c91"
+            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.2/Libavcodec.xcframework.zip",
+            checksum: "7f4bec110bfdfa45b58b8a8fd431b826d8f0b0513f3925a4a516bfbc30fabf90"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.1/Libavdevice.xcframework.zip",
-            checksum: "eecf09766da0b7ad1fb1dd53c55052db62c84d3a3124edc9553a67806f813c5b"
+            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.2/Libavdevice.xcframework.zip",
+            checksum: "343a65e49a4a36ffe3423168ac4b83345aca31812fdcafb999602100c839c3ba"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.1/Libavformat.xcframework.zip",
-            checksum: "8c417bd36cf77906e105b213f1431c543eadc954c20c8b6b143f5d2dc0686bd2"
+            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.2/Libavformat.xcframework.zip",
+            checksum: "5426827f040e4fc3627f9fda5a85dc7965b5ec6f655a8b903725be5e9682c8bc"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.1/Libavfilter.xcframework.zip",
-            checksum: "343f146a4839fcb7e80bee322f2ac86318ccd4cabb0f7f7f3f4782c77edbff11"
+            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.2/Libavfilter.xcframework.zip",
+            checksum: "c311843fba151dbc9815506014e58d1d74c856a9106370168bd9777cccf9f3b9"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.1/Libavutil.xcframework.zip",
-            checksum: "5c24e10d7bfacd82568b1d803227c4e37e159290ee3f37ff76d81d36f482ef1f"
+            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.2/Libavutil.xcframework.zip",
+            checksum: "573af24781f7cbdf9af4f8f6db9be0665ccfe67953280420af2a855446aae854"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.1/Libswresample.xcframework.zip",
-            checksum: "0f1338ed7b96e269599b12d7fdf6d0c447ea682b4104685cefb77e083b39ba7d"
+            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.2/Libswresample.xcframework.zip",
+            checksum: "1273279ef98b26c509a4b7557f79b722ce29ccbeddcab1f0a0da506ad61c4e29"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.1/Libswscale.xcframework.zip",
-            checksum: "10a7e531049d87f86b2813e92f79b8e04ae4297d7baecf16054cd61788857bd6"
+            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.2/Libswscale.xcframework.zip",
+            checksum: "fc9f15a06d56f470d40f91dddc3afff6bae995a5d4ddc6023b4a2b738dc4129b"
         ),
 
         .binaryTarget(
@@ -301,8 +301,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.1/Libmpv.xcframework.zip",
-            checksum: "d0d8dbda8d7022d59da1d3c41f14cc8d9b7f75b643f51ee4d9a4f38a7aaf2f28"
+            url: "https://github.com/DreadPirateBill/MPVKit/releases/download/1.0.2/Libmpv.xcframework.zip",
+            checksum: "5c5e32a765a2c8e66186381924995e05e41e0baa7e44b3d804cf7f36cd44ac3c"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
