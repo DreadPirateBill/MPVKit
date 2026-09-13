@@ -392,7 +392,8 @@ private class BuildMPV: BaseBuild {
             "-Dmoltenvk=enabled",  // from patch option
 
             "-Djavascript=disabled",
-            "-Dx11=disabled",          // Sprocket fork: meson autodetects X11 headers on a Mac with XQuartz/Homebrew and pulls in the X11 clipboard; never wanted on Apple targets
+            "-Dx11=disabled",          // Sprocket fork: meson autodetects X11 on a Mac with XQuartz/Homebrew via the host pkg-config; never wanted on Apple targets
+            "-Dx11-clipboard=disabled",   // gated separately from x11: this is what pulled player/clipboard/clipboard-x11.c into libmpv
             "-Dwayland=disabled",
             "-Dzimg=disabled",
             "-Djpeg=disabled",
