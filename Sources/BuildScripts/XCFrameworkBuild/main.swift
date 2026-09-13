@@ -392,6 +392,8 @@ private class BuildMPV: BaseBuild {
             "-Dmoltenvk=enabled",  // from patch option
 
             "-Djavascript=disabled",
+            "-Dx11=disabled",          // Sprocket fork: meson autodetects X11 headers on a Mac with XQuartz/Homebrew and pulls in the X11 clipboard; never wanted on Apple targets
+            "-Dwayland=disabled",
             "-Dzimg=disabled",
             "-Djpeg=disabled",
             "-Dvapoursynth=disabled",

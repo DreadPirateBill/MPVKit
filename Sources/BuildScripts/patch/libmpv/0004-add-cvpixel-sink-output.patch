@@ -449,10 +449,10 @@ index 0000000..8d531d6
 +void ra_cvpixel_flush(struct ra_ctx *ctx);
 diff --git forkSrcPrefix/video/out/vulkan/context_cvpixel.m forkDstPrefix/video/out/vulkan/context_cvpixel.m
 new file mode 100644
-index 0000000..b1cbf70
+index 0000000..a7c0e18
 --- /dev/null
 +++ forkDstPrefix/video/out/vulkan/context_cvpixel.m
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,301 @@
 +/*
 + * This file is part of mpv (Sprocket Player fork).
 + *
@@ -500,8 +500,6 @@ index 0000000..b1cbf70
 +    pl_tex tex;
 +    struct pl_color_space csp;
 +};
-+
-+static const struct ra_ctx_fns ra_ctx_vulkan_cvpixel_fns;
 +
 +// The Metal device MoltenVK is using, so the texture cache creates textures on
 +// the same device libplacebo renders with (same approach as hwdec_vt_pl.m).
