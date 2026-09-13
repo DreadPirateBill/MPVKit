@@ -136,12 +136,21 @@ class BaseBuild {
         }
     }
 
+    /// Sprocket fork: `MPVKIT_REUSE_THIN=1` keeps already-built per-arch outputs (dist/<lib>/<platform>/thin/<arch>) and only builds the missing ones,
+    /// so a packaging or later-library failure doesn't cost a full FFmpeg rebuild.
+    static let reuseThin = ProcessInfo.processInfo.environment["MPVKIT_REUSE_THIN"] != nil
+
     func buildALL() throws {
         try beforeBuild()
-        try? FileManager.default.removeItem(at: URL.currentDirectory + library.rawValue)
+        if !BaseBuild.reuseThin {
+            try? FileManager.default.removeItem(at: URL.currentDirectory + library.rawValue)
+        }
         try? FileManager.default.removeItem(at: directoryURL.appendingPathExtension("log"))
         for platform in BaseBuild.platforms {
             for arch in architectures(platform) {
+                if BaseBuild.reuseThin, FileManager.default.fileExists(atPath: (thinDir(platform: platform, arch: arch) + "lib").path) {
+                    continue
+                }
                 try build(platform: platform, arch: arch)
             }
         }
@@ -153,6 +162,19 @@ class BaseBuild {
     func afterBuild() throws {
         try verifyMinVersions()
         try generatePackageManagerFile()
+    }
+
+    /// Sprocket fork: the installed archive is `libavutil.a` while the framework is named `Libavutil`; on a case-sensitive volume the capitalised name
+    /// doesn't resolve. Try the name as given, then with a lowercase `lib` prefix, for both static and dynamic libraries.
+    static func existingLibrary(in prefix: URL, named name: String) -> URL? {
+        let lower = name.hasPrefix("Lib") ? "lib" + name.dropFirst(3) : name
+        for candidate in [name, lower] {
+            for ext in ["a", "dylib"] {
+                let url = prefix + ["lib", "\(candidate).\(ext)"]
+                if FileManager.default.fileExists(atPath: url.path) { return url }
+            }
+        }
+        return nil
     }
 
     private func verifyMinVersions() throws {
@@ -170,11 +192,7 @@ class BaseBuild {
                     guard FileManager.default.fileExists(atPath: prefix.path) else { continue }
                     guard !platform.minVersion.isEmpty else { continue }
 
-                    var libPath = prefix + ["lib", "\(frameworkName).a"]
-                    if !FileManager.default.fileExists(atPath: libPath.path) {
-                        libPath = prefix + ["lib", "\(frameworkName).dylib"]
-                    }
-                    guard FileManager.default.fileExists(atPath: libPath.path) else { continue }
+                    guard let libPath = BaseBuild.existingLibrary(in: prefix, named: frameworkName) else { continue }
 
                     let output = try Utility.launch(path: "/usr/bin/otool", arguments: ["-l", libPath.path], isOutput: true, isPrint: false)
 
@@ -458,9 +476,8 @@ class BaseBuild {
                 return nil
             }
             let libname = framework.hasPrefix("lib") || framework.hasPrefix("Lib") ? framework : "lib" + framework
-            var libPath = prefix + ["lib", "\(libname).a"]
-            if !FileManager.default.fileExists(atPath: libPath.path) {
-                libPath = prefix + ["lib", "\(libname).dylib"]
+            guard let libPath = BaseBuild.existingLibrary(in: prefix, named: libname) else {
+                throw NSError(domain: "MPVKit", code: 2, userInfo: [NSLocalizedDescriptionKey: "no library for \(framework) under \(prefix.path)/lib"])
             }
             arguments.append(libPath.path)
             var headerURL: URL = prefix + "include" + framework

@@ -1,0 +1,758 @@
+diff --git forkSrcPrefix/include/mpv/cvpixel.h forkDstPrefix/include/mpv/cvpixel.h
+new file mode 100644
+index 0000000..822b2d2
+--- /dev/null
++++ forkDstPrefix/include/mpv/cvpixel.h
+@@ -0,0 +1,124 @@
++/* Copyright (C) 2026 William Alexander
++ *
++ * This file is part of mpv (Sprocket Player fork).
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef MPV_CLIENT_API_CVPIXEL_H_
++#define MPV_CLIENT_API_CVPIXEL_H_
++
++/*
++ * The CVPixelBuffer sink: an alternative video output for Apple platforms in
++ * which mpv (gpu-next + libplacebo) renders every finished frame into a
++ * CVPixelBuffer the client supplies, instead of presenting to a CAMetalLayer.
++ * The client then hands the buffer to AVFoundation (AVSampleBufferDisplayLayer),
++ * the only path on tvOS that can drive an HDR display. libplacebo's scaling,
++ * debanding, tone/gamut mapping and Dolby Vision reshaping all still apply.
++ *
++ * Usage:
++ *   - set "vo" to "gpu-next", "gpu-api" to "vulkan", "gpu-context" to "cvpixel"
++ *   - set the option "cvpixel-sink" (MPV_FORMAT_INT64) to the address of a
++ *     mpv_cvpixel_sink that outlives the mpv core
++ *   - set "target-colorspace-hint" to "yes" to receive HDR frames encoded in
++ *     the source's colour space (PQ / HLG, BT.2020); leave it "no" for SDR
++ *     BT.709 frames with libplacebo tone-mapping
++ *
++ * All callbacks are invoked on mpv's VO thread and must not call back into
++ * libmpv. Buffers are IOSurface-backed kCVPixelFormatType_64RGBAHalf, full
++ * range RGB, encoded per `mpv_cvpixel_color`.
++ */
++
++#include <stdint.h>
++#include <CoreVideo/CoreVideo.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef enum mpv_cvpixel_primaries {
++    MPV_CVPIXEL_PRIM_UNKNOWN = 0,
++    MPV_CVPIXEL_PRIM_BT709   = 1,
++    MPV_CVPIXEL_PRIM_BT2020  = 2,
++    MPV_CVPIXEL_PRIM_P3      = 3,
++} mpv_cvpixel_primaries;
++
++typedef enum mpv_cvpixel_transfer {
++    MPV_CVPIXEL_TRC_UNKNOWN = 0,   // SDR, BT.1886 / gamma 2.2
++    MPV_CVPIXEL_TRC_SRGB    = 1,
++    MPV_CVPIXEL_TRC_PQ      = 2,
++    MPV_CVPIXEL_TRC_HLG     = 3,
++} mpv_cvpixel_transfer;
++
++/**
++ * How the pixels of a presented buffer are encoded, plus the static HDR
++ * metadata mpv rendered against (all in cd/m²; 0 when unknown). The client
++ * attaches these to the buffer for the display pipeline.
++ */
++typedef struct mpv_cvpixel_color {
++    int primaries;      // mpv_cvpixel_primaries
++    int transfer;       // mpv_cvpixel_transfer
++    float min_luma;     // mastering display minimum luminance
++    float max_luma;     // mastering display maximum luminance
++    float max_cll;      // maximum content light level
++    float max_fall;     // maximum frame-average light level
++    float red[2];       // mastering display primaries, CIE 1931 xy (0 when unknown)
++    float green[2];
++    float blue[2];
++    float white[2];
++} mpv_cvpixel_color;
++
++/**
++ * The client's side of the sink. Every field except `flush` and `size` is
++ * required.
++ */
++typedef struct mpv_cvpixel_sink {
++    void *user_data;
++
++    /**
++     * The output size in pixels mpv should render at. Called on reconfigure.
++     * Optional: when NULL (or when it yields a non-positive size) mpv renders
++     * at 1920x1080.
++     */
++    void (*size)(void *user_data, int *width, int *height);
++
++    /**
++     * Provide a buffer for one frame: exactly width x height, IOSurface-backed,
++     * of the given pixel format (currently always kCVPixelFormatType_64RGBAHalf).
++     * Return it with a +1 retain; mpv releases its reference after `present`.
++     * Returning NULL skips the frame.
++     */
++    CVPixelBufferRef (*acquire)(void *user_data, int width, int height,
++                                uint32_t pixel_format);
++
++    /**
++     * The frame has been rendered and the GPU work has completed. Ownership of
++     * `buffer` (the +1 from acquire) passes to the client, which must release
++     * it when done. `color` describes the encoding.
++     */
++    void (*present)(void *user_data, CVPixelBufferRef buffer,
++                    const mpv_cvpixel_color *color);
++
++    /**
++     * Playback was reset (seek, new file, stop): drop any frames the client
++     * still holds queued for display. Optional.
++     */
++    void (*flush)(void *user_data);
++} mpv_cvpixel_sink;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git forkSrcPrefix/meson.build forkDstPrefix/meson.build
+index 42ece8e..79a2c8e 100644
+--- forkSrcPrefix/meson.build
++++ forkDstPrefix/meson.build
+@@ -1337,7 +1337,8 @@ if host_machine.system() == 'darwin'
+     )
+     features += {'moltenvk': moltenvk.allowed()}
+     if features['vulkan'] and features['moltenvk']
+-        sources += files('video/out/vulkan/context_moltenvk.m')
++        sources += files('video/out/vulkan/context_moltenvk.m',
++                         'video/out/vulkan/context_cvpixel.m')
+     endif
+ endif
+ 
+@@ -1807,7 +1808,8 @@ if get_option('libmpv')
+                  description: 'mpv media player client library')
+ 
+     headers = ['include/mpv/client.h', 'include/mpv/render.h',
+-               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h']
++               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h',
++               'include/mpv/cvpixel.h']
+     install_headers(headers, subdir: 'mpv')
+ 
+     # Allow projects to build with libmpv by cloning into ./subprojects/mpv
+diff --git forkSrcPrefix/options/options.c forkDstPrefix/options/options.c
+index 716c3e6..f877ce9 100644
+--- forkSrcPrefix/options/options.c
++++ forkDstPrefix/options/options.c
+@@ -171,6 +171,7 @@ static const m_option_t mp_vo_opt_list[] = {
+         {"no", 0}, {"yes", 1}, {"downscale-big", 2})},
+     {"video-recenter", OPT_BOOL(recenter)},
+     {"wid", OPT_INT64(WinID), .flags = UPDATE_VO},
++    {"cvpixel-sink", OPT_INT64(cvpixel_sink), .flags = UPDATE_VO},
+     {"screen", OPT_CHOICE(screen_id, {"default", -1}), M_RANGE(0, 32)},
+     {"screen-name", OPT_STRING(screen_name)},
+     {"fs-screen", OPT_CHOICE(fsscreen_id, {"all", -2}, {"current", -1}),
+diff --git forkSrcPrefix/options/options.h forkDstPrefix/options/options.h
+index 12dafea..a2d0bdf 100644
+--- forkSrcPrefix/options/options.h
++++ forkDstPrefix/options/options.h
+@@ -69,6 +69,7 @@ typedef struct mp_vo_opts {
+     bool show_in_taskbar;
+ 
+     int64_t WinID;
++    int64_t cvpixel_sink;   // mpv_cvpixel_sink * for gpu-context=cvpixel (Apple)
+ 
+     float force_monitor_aspect;
+     float monitor_pixel_aspect;
+diff --git forkSrcPrefix/video/out/gpu/context.c forkDstPrefix/video/out/gpu/context.c
+index a1e3952..a3b357c 100644
+--- forkSrcPrefix/video/out/gpu/context.c
++++ forkDstPrefix/video/out/gpu/context.c
+@@ -51,6 +51,7 @@ extern const struct ra_ctx_fns ra_ctx_vulkan_android;
+ extern const struct ra_ctx_fns ra_ctx_vulkan_display;
+ extern const struct ra_ctx_fns ra_ctx_vulkan_mac;
+ extern const struct ra_ctx_fns ra_ctx_vulkan_moltenvk;
++extern const struct ra_ctx_fns ra_ctx_vulkan_cvpixel;
+ 
+ /* Direct3D 11 */
+ extern const struct ra_ctx_fns ra_ctx_d3d11;
+@@ -96,6 +97,7 @@ static const struct ra_ctx_fns *const contexts[] = {
+ #endif
+ #if HAVE_MOLTENVK
+      &ra_ctx_vulkan_moltenvk,
++     &ra_ctx_vulkan_cvpixel,
+ #endif
+ #if HAVE_COCOA && HAVE_SWIFT
+     &ra_ctx_vulkan_mac,
+diff --git forkSrcPrefix/video/out/vo_gpu_next.c forkDstPrefix/video/out/vo_gpu_next.c
+index 2d95eb8..30e493f 100644
+--- forkSrcPrefix/video/out/vo_gpu_next.c
++++ forkDstPrefix/video/out/vo_gpu_next.c
+@@ -48,6 +48,9 @@
+ #include "gpu/video_shaders.h"
+ #include "sub/osd.h"
+ #include "gpu_next/context.h"
++#if HAVE_MOLTENVK
++#include "vulkan/context_cvpixel.h"
++#endif
+ 
+ #if HAVE_GL && defined(PL_HAVE_OPENGL)
+ #include <libplacebo/opengl.h>
+@@ -135,6 +138,11 @@ struct priv {
+     bool want_reset;
+     bool frame_pending;
+ 
++    // gpu-context=cvpixel: no pl_swapchain; the context supplies the target
++    bool cvpixel;
++    struct pl_color_space cv_hint;
++    bool cv_use_hint;
++
+     pl_options pars;
+     struct m_config_cache *opts_cache;
+     struct m_config_cache *next_opts_cache;
+@@ -1230,17 +1238,43 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         // Update again after possible max_luma change
+         if (p->icc_profile)
+             hint = p->icc_profile->csp;
+-        if (!pass_colorspace)
+-            pl_swapchain_colorspace_hint(p->sw, &hint);
++        if (!pass_colorspace) {
++            if (p->sw) {
++                pl_swapchain_colorspace_hint(p->sw, &hint);
++            } else {
++                p->cv_hint = hint;
++                p->cv_use_hint = true;
++            }
++        }
+     } else if (!target_hint) {
+         if (!hint.hdr.min_luma)
+             hint.hdr.min_luma = target_csp.hdr.min_luma;
+-        pl_swapchain_colorspace_hint(p->sw, NULL);
++        if (p->sw) {
++            pl_swapchain_colorspace_hint(p->sw, NULL);
++        } else {
++            p->cv_use_hint = false;
++        }
+     }
+ 
+-    struct pl_swapchain_frame swframe;
++    struct pl_swapchain_frame swframe = {0};
+     bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
+-    if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
++    bool started = false;
++    if (should_draw) {
++#if HAVE_MOLTENVK
++        if (p->cvpixel) {
++            // The sink gets frames in the hinted (source) colour space when
++            // target-colorspace-hint is on, else SDR BT.709 after tone mapping.
++            struct pl_color_space csp = p->cv_use_hint ? p->cv_hint
++                : (struct pl_color_space) { .primaries = PL_COLOR_PRIM_BT_709,
++                                            .transfer  = PL_COLOR_TRC_BT_1886 };
++            started = ra_cvpixel_start_frame(p->ra_ctx, &csp, &swframe);
++        } else
++#endif
++        {
++            started = pl_swapchain_start_frame(p->sw, &swframe);
++        }
++    }
++    if (!should_draw || !started) {
+         if (frame->current) {
+             // Advance the queue state to the current PTS to discard unused frames
+             struct pl_queue_params qparams = *pl_queue_params(
+@@ -1449,8 +1483,14 @@ static void flip_page(struct vo *vo)
+     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+ 
+     if (p->frame_pending) {
+-        if (!pl_swapchain_submit_frame(p->sw))
++#if HAVE_MOLTENVK
++        if (p->cvpixel) {
++            ra_cvpixel_submit_frame(p->ra_ctx);
++        } else
++#endif
++        if (!pl_swapchain_submit_frame(p->sw)) {
+             MP_ERR(vo, "Failed presenting frame!\n");
++        }
+         p->frame_pending = false;
+     }
+ 
+@@ -1833,6 +1873,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     case VOCTRL_RESET:
+         // Defer until the first new frame (unique ID) actually arrives
+         p->want_reset = true;
++#if HAVE_MOLTENVK
++        if (p->cvpixel)
++            ra_cvpixel_flush(p->ra_ctx);
++#endif
+         return VO_TRUE;
+ 
+     case VOCTRL_PERFORMANCE_DATA: {
+@@ -2149,6 +2193,9 @@ static int preinit(struct vo *vo)
+     p->pllog = p->context->pllog;
+     p->gpu = p->context->gpu;
+     p->sw = p->context->swapchain;
++#if HAVE_MOLTENVK
++    p->cvpixel = ra_cvpixel_ctx_is(p->ra_ctx);
++#endif
+     p->hwdec_ctx = (struct ra_hwdec_ctx) {
+         .log = p->log,
+         .global = p->global,
+diff --git forkSrcPrefix/video/out/vulkan/context.c forkDstPrefix/video/out/vulkan/context.c
+index 7c196eb..071d948 100644
+--- forkSrcPrefix/video/out/vulkan/context.c
++++ forkDstPrefix/video/out/vulkan/context.c
+@@ -140,9 +140,12 @@ struct priv {
+ 
+ static const struct ra_swapchain_fns vulkan_swapchain;
+ 
++static const struct ra_swapchain_fns headless_swapchain;
++
+ struct mpvk_ctx *ra_vk_ctx_get(struct ra_ctx *ctx)
+ {
+-    if (!ctx->swapchain || ctx->swapchain->fns != &vulkan_swapchain)
++    if (!ctx->swapchain || (ctx->swapchain->fns != &vulkan_swapchain &&
++                            ctx->swapchain->fns != &headless_swapchain))
+         return NULL;
+ 
+     struct priv *p = ctx->swapchain->priv;
+@@ -440,13 +443,76 @@ bool ra_vk_ctx_resize(struct ra_ctx *ctx, int width, int height)
+ {
+     struct priv *p = ctx->swapchain->priv;
+ 
+-    bool ok = pl_swapchain_resize(p->vk->swapchain, &width, &height);
++    // A headless context (cvpixel) has no swapchain to resize; the size is
++    // whatever the client renders at.
++    bool ok = p->vk->swapchain ? pl_swapchain_resize(p->vk->swapchain, &width, &height)
++                               : true;
+     ctx->vo->dwidth = width;
+     ctx->vo->dheight = height;
+ 
+     return ok;
+ }
+ 
++// A context without a swapchain: gpu-next supplies its own render target
++// (see context_cvpixel.m). Only the ra_swapchain plumbing that vo_gpu_next
++// touches is stubbed; the ra (vo_gpu) path is unsupported and start_frame
++// refuses it.
++static bool headless_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
++{
++    return out_fbo == NULL;
++}
++
++static bool headless_submit_frame(struct ra_swapchain *sw, const struct vo_frame *frame)
++{
++    return true;
++}
++
++static void headless_swap_buffers(struct ra_swapchain *sw)
++{
++}
++
++static int headless_color_depth(struct ra_swapchain *sw)
++{
++    return 16;
++}
++
++static const struct ra_swapchain_fns headless_swapchain = {
++    .color_depth   = headless_color_depth,
++    .start_frame   = headless_start_frame,
++    .submit_frame  = headless_submit_frame,
++    .swap_buffers  = headless_swap_buffers,
++};
++
++bool ra_vk_ctx_init_headless(struct ra_ctx *ctx, struct mpvk_ctx *vk,
++                             struct ra_ctx_params params)
++{
++    struct ra_swapchain *sw = ctx->swapchain = talloc_zero(NULL, struct ra_swapchain);
++    sw->ctx = ctx;
++    sw->fns = &headless_swapchain;
++
++    struct priv *p = sw->priv = talloc_zero(sw, struct priv);
++    p->vk = vk;
++    p->params = params;
++    p->opts = mp_get_config_group(p, ctx->global, &vulkan_conf);
++
++    vk->vulkan = mppl_create_vulkan(p->opts, vk->vkinst, vk->pllog, VK_NULL_HANDLE,
++                                    ctx->opts.allow_sw);
++    if (!vk->vulkan)
++        goto error;
++
++    vk->gpu = vk->vulkan->gpu;
++    ctx->ra = ra_create_pl(vk->gpu, ctx->log);
++    if (!ctx->ra)
++        goto error;
++
++    vk->swapchain = NULL;
++    return true;
++
++error:
++    ra_vk_ctx_uninit(ctx);
++    return false;
++}
++
+ char *ra_vk_ctx_get_device_name(struct ra_ctx *ctx)
+ {
+     /*
+diff --git forkSrcPrefix/video/out/vulkan/context.h forkDstPrefix/video/out/vulkan/context.h
+index c3013ed..aa3ada0 100644
+--- forkSrcPrefix/video/out/vulkan/context.h
++++ forkDstPrefix/video/out/vulkan/context.h
+@@ -9,6 +9,10 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
+                     struct ra_ctx_params params,
+                     VkPresentModeKHR preferred_mode);
+ 
++// Like ra_vk_ctx_init but without a surface or swapchain (see context_cvpixel.m).
++bool ra_vk_ctx_init_headless(struct ra_ctx *ctx, struct mpvk_ctx *vk,
++                             struct ra_ctx_params params);
++
+ // Helper for initializing mpvk_ctx->vulkan
+ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
+                              pl_vk_inst vkinst,
+diff --git forkSrcPrefix/video/out/vulkan/context_cvpixel.h forkDstPrefix/video/out/vulkan/context_cvpixel.h
+new file mode 100644
+index 0000000..8d531d6
+--- /dev/null
++++ forkDstPrefix/video/out/vulkan/context_cvpixel.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <libplacebo/renderer.h>
++#include "video/out/gpu/context.h"
++
++// The "cvpixel" gpu-context (Apple only): headless Vulkan (MoltenVK) whose
++// render target is a Metal texture imported from a client-supplied
++// CVPixelBuffer. See include/mpv/cvpixel.h for the client side.
++
++// Whether `ctx` is a cvpixel context.
++bool ra_cvpixel_ctx_is(struct ra_ctx *ctx);
++
++// Acquire a buffer from the sink and wrap it as a render target encoded in
++// `csp`. On success fills `out_frame` (single RGBA16F plane, full-range RGB).
++bool ra_cvpixel_start_frame(struct ra_ctx *ctx, const struct pl_color_space *csp,
++                            struct pl_swapchain_frame *out_frame);
++
++// Wait for the GPU, hand the buffer to the sink, release the wrapper.
++void ra_cvpixel_submit_frame(struct ra_ctx *ctx);
++
++// Drop an unsubmitted frame and tell the sink to flush.
++void ra_cvpixel_flush(struct ra_ctx *ctx);
+diff --git forkSrcPrefix/video/out/vulkan/context_cvpixel.m forkDstPrefix/video/out/vulkan/context_cvpixel.m
+new file mode 100644
+index 0000000..b1cbf70
+--- /dev/null
++++ forkDstPrefix/video/out/vulkan/context_cvpixel.m
+@@ -0,0 +1,303 @@
++/*
++ * This file is part of mpv (Sprocket Player fork).
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// The "cvpixel" gpu-context: headless MoltenVK whose render target is a Metal
++// texture imported from a client-supplied CVPixelBuffer. gpu-next renders into
++// it exactly as it would into a swapchain image (scaling, debanding, tone
++// mapping, Dolby Vision reshaping, OSD), and the finished buffer goes back to
++// the client for AVFoundation to display. Companion to context_moltenvk.m,
++// which presents to a CAMetalLayer instead.
++
++#include <CoreVideo/CoreVideo.h>
++#include <Metal/Metal.h>
++#include <MoltenVK/mvk_vulkan.h>
++#include <libplacebo/vulkan.h>
++
++#include "mpv/cvpixel.h"
++#include "common.h"
++#include "context.h"
++#include "context_cvpixel.h"
++#include "utils.h"
++
++struct priv {
++    struct mpvk_ctx vk;
++    mpv_cvpixel_sink *sink;
++    CVMetalTextureCacheRef cache;
++    pl_fmt fmt;
++
++    // The frame between start_frame and submit_frame
++    CVPixelBufferRef pbuf;
++    CVMetalTextureRef mtltex;
++    pl_tex tex;
++    struct pl_color_space csp;
++};
++
++static const struct ra_ctx_fns ra_ctx_vulkan_cvpixel_fns;
++
++// The Metal device MoltenVK is using, so the texture cache creates textures on
++// the same device libplacebo renders with (same approach as hwdec_vt_pl.m).
++static id<MTLDevice> mtl_device_for(pl_vulkan vulkan)
++{
++    id<MTLDevice> dev = nil;
++#ifdef VK_EXT_METAL_OBJECTS_SPEC_VERSION
++    if (vulkan && vulkan->device && vulkan->instance && vulkan->get_proc_addr) {
++        PFN_vkExportMetalObjectsEXT export_fn = (PFN_vkExportMetalObjectsEXT)
++            vulkan->get_proc_addr(vulkan->instance, "vkExportMetalObjectsEXT");
++        if (export_fn) {
++            VkExportMetalDeviceInfoEXT dev_info = {
++                .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT,
++            };
++            VkExportMetalObjectsInfoEXT info = {
++                .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
++                .pNext = &dev_info,
++            };
++            export_fn(vulkan->device, &info);
++            dev = dev_info.mtlDevice;
++            [dev retain];
++        }
++    }
++#endif
++    if (!dev)
++        dev = MTLCreateSystemDefaultDevice();
++    return dev;
++}
++
++static void drop_frame(struct priv *p)
++{
++    if (p->tex)
++        pl_tex_destroy(p->vk.gpu, &p->tex);
++    if (p->mtltex) {
++        CFRelease(p->mtltex);
++        p->mtltex = NULL;
++    }
++    if (p->pbuf) {
++        CVPixelBufferRelease(p->pbuf);
++        p->pbuf = NULL;
++    }
++}
++
++static void cvpixel_uninit(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    if (!p)
++        return;
++    drop_frame(p);
++    if (p->cache) {
++        CFRelease(p->cache);
++        p->cache = NULL;
++    }
++    ra_vk_ctx_uninit(ctx);
++    mpvk_uninit(&p->vk);
++}
++
++static bool cvpixel_init(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
++    struct mpvk_ctx *vk = &p->vk;
++    int msgl = ctx->opts.probing ? MSGL_V : MSGL_ERR;
++
++    p->sink = (mpv_cvpixel_sink *)(intptr_t)ctx->vo->opts->cvpixel_sink;
++    if (!p->sink || !p->sink->acquire || !p->sink->present) {
++        MP_MSG(ctx, msgl, "cvpixel-sink missing or incomplete\n");
++        goto fail;
++    }
++
++    // The Metal surface extension is harmless without a surface; requesting
++    // it keeps instance creation identical to the moltenvk context.
++    if (!mpvk_init(vk, ctx, VK_EXT_METAL_SURFACE_EXTENSION_NAME))
++        goto fail;
++
++    struct ra_ctx_params params = {0};
++    if (!ra_vk_ctx_init_headless(ctx, vk, params))
++        goto fail;
++
++    p->fmt = pl_find_fmt(vk->gpu, PL_FMT_FLOAT, 4, 16, 16,
++                         PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_BLITTABLE);
++    if (!p->fmt) {
++        MP_MSG(ctx, msgl, "No renderable RGBA16F format\n");
++        goto fail;
++    }
++
++    id<MTLDevice> dev = mtl_device_for(vk->vulkan);
++    CVReturn err = CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, dev, NULL, &p->cache);
++    [dev release];
++    if (err != noErr) {
++        MP_MSG(ctx, msgl, "CVMetalTextureCacheCreate failed: %d\n", (int)err);
++        goto fail;
++    }
++
++    return true;
++
++fail:
++    cvpixel_uninit(ctx);
++    return false;
++}
++
++static bool cvpixel_reconfig(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    int w = 0, h = 0;
++    if (p->sink->size)
++        p->sink->size(p->sink->user_data, &w, &h);
++    if (w <= 0 || h <= 0) {
++        w = 1920;
++        h = 1080;
++    }
++    return ra_vk_ctx_resize(ctx, w, h);
++}
++
++static int cvpixel_control(struct ra_ctx *ctx, int *events, int request, void *arg)
++{
++    return VO_NOTIMPL;
++}
++
++const struct ra_ctx_fns ra_ctx_vulkan_cvpixel = {
++    .type           = "vulkan",
++    .name           = "cvpixel",
++    .reconfig       = cvpixel_reconfig,
++    .control        = cvpixel_control,
++    .init           = cvpixel_init,
++    .uninit         = cvpixel_uninit,
++};
++
++bool ra_cvpixel_ctx_is(struct ra_ctx *ctx)
++{
++    return ctx && ctx->fns == &ra_ctx_vulkan_cvpixel;
++}
++
++bool ra_cvpixel_start_frame(struct ra_ctx *ctx, const struct pl_color_space *csp,
++                            struct pl_swapchain_frame *out_frame)
++{
++    struct priv *p = ctx->priv;
++    pl_gpu gpu = p->vk.gpu;
++
++    drop_frame(p);   // a frame that was started but never submitted
++
++    int w = ctx->vo->dwidth, h = ctx->vo->dheight;
++    if (w <= 0 || h <= 0)
++        return false;
++
++    CVPixelBufferRef buf = p->sink->acquire(p->sink->user_data, w, h,
++                                            kCVPixelFormatType_64RGBAHalf);
++    if (!buf)
++        return false;
++
++    size_t bw = CVPixelBufferGetWidth(buf), bh = CVPixelBufferGetHeight(buf);
++    CVMetalTextureRef mtltex = NULL;
++    CVReturn err = CVMetalTextureCacheCreateTextureFromImage(
++        kCFAllocatorDefault, p->cache, buf, NULL, MTLPixelFormatRGBA16Float,
++        bw, bh, 0, &mtltex);
++    if (err != noErr || !mtltex) {
++        MP_ERR(ctx, "CVMetalTextureCacheCreateTextureFromImage failed: %d\n", (int)err);
++        CVPixelBufferRelease(buf);
++        return false;
++    }
++
++    pl_tex tex = pl_tex_create(gpu, &(struct pl_tex_params) {
++        .w = bw,
++        .h = bh,
++        .format = p->fmt,
++        .renderable = true,
++        .blit_dst = true,
++        .import_handle = PL_HANDLE_MTL_TEX,
++        .shared_mem = (struct pl_shared_mem) {
++            .handle = { .handle = CVMetalTextureGetTexture(mtltex) },
++        },
++    });
++    if (!tex) {
++        MP_ERR(ctx, "Failed importing the CVPixelBuffer's Metal texture\n");
++        CFRelease(mtltex);
++        CVPixelBufferRelease(buf);
++        return false;
++    }
++
++    p->pbuf = buf;
++    p->mtltex = mtltex;
++    p->tex = tex;
++    p->csp = *csp;
++
++    *out_frame = (struct pl_swapchain_frame) {
++        .fbo = tex,
++        .flipped = false,
++        .color_repr = {
++            .sys = PL_COLOR_SYSTEM_RGB,
++            .levels = PL_COLOR_LEVELS_FULL,
++            .alpha = PL_ALPHA_UNKNOWN,
++            .bits = { .sample_depth = 16, .color_depth = 16 },
++        },
++        .color_space = *csp,
++    };
++    return true;
++}
++
++static void fill_color(mpv_cvpixel_color *out, const struct pl_color_space *csp)
++{
++    *out = (mpv_cvpixel_color) {0};
++    switch (csp->primaries) {
++    case PL_COLOR_PRIM_BT_709:    out->primaries = MPV_CVPIXEL_PRIM_BT709;  break;
++    case PL_COLOR_PRIM_BT_2020:   out->primaries = MPV_CVPIXEL_PRIM_BT2020; break;
++    case PL_COLOR_PRIM_DCI_P3:
++    case PL_COLOR_PRIM_DISPLAY_P3: out->primaries = MPV_CVPIXEL_PRIM_P3;    break;
++    default:                      out->primaries = MPV_CVPIXEL_PRIM_UNKNOWN; break;
++    }
++    switch (csp->transfer) {
++    case PL_COLOR_TRC_PQ:   out->transfer = MPV_CVPIXEL_TRC_PQ;   break;
++    case PL_COLOR_TRC_HLG:  out->transfer = MPV_CVPIXEL_TRC_HLG;  break;
++    case PL_COLOR_TRC_SRGB: out->transfer = MPV_CVPIXEL_TRC_SRGB; break;
++    default:                out->transfer = MPV_CVPIXEL_TRC_UNKNOWN; break;
++    }
++    out->min_luma = csp->hdr.min_luma;
++    out->max_luma = csp->hdr.max_luma;
++    out->max_cll  = csp->hdr.max_cll;
++    out->max_fall = csp->hdr.max_fall;
++    out->red[0]   = csp->hdr.prim.red.x;   out->red[1]   = csp->hdr.prim.red.y;
++    out->green[0] = csp->hdr.prim.green.x; out->green[1] = csp->hdr.prim.green.y;
++    out->blue[0]  = csp->hdr.prim.blue.x;  out->blue[1]  = csp->hdr.prim.blue.y;
++    out->white[0] = csp->hdr.prim.white.x; out->white[1] = csp->hdr.prim.white.y;
++}
++
++void ra_cvpixel_submit_frame(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    if (!p->pbuf)
++        return;
++
++    // Rendering into an imported Metal texture: make sure the GPU is done
++    // before AVFoundation samples it. A shared event would avoid the stall;
++    // first version keeps it simple.
++    pl_gpu_finish(p->vk.gpu);
++
++    mpv_cvpixel_color color;
++    fill_color(&color, &p->csp);
++
++    CVPixelBufferRef buf = p->pbuf;   // the +1 from acquire passes to the sink
++    p->pbuf = NULL;
++    pl_tex_destroy(p->vk.gpu, &p->tex);
++    CFRelease(p->mtltex);
++    p->mtltex = NULL;
++
++    p->sink->present(p->sink->user_data, buf, &color);
++    CVMetalTextureCacheFlush(p->cache, 0);
++}
++
++void ra_cvpixel_flush(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    drop_frame(p);
++    if (p->sink->flush)
++        p->sink->flush(p->sink->user_data);
++}
