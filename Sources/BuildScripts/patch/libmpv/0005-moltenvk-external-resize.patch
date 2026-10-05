@@ -1,0 +1,71 @@
+diff --git forkSrcPrefix/options/options.c forkDstPrefix/options/options.c
+--- forkSrcPrefix/options/options.c
++++ forkDstPrefix/options/options.c
+@@ -246,6 +246,9 @@
+ #if HAVE_EGL_ANDROID
+     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
+ #endif
++#if HAVE_MOLTENVK
++    {"moltenvk-surface-size", OPT_SIZE_BOX(moltenvk_surface_size)},
++#endif
+ #if HAVE_D3D11
+     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
+ #endif
+diff --git forkSrcPrefix/options/options.h forkDstPrefix/options/options.h
+--- forkSrcPrefix/options/options.h
++++ forkDstPrefix/options/options.h
+@@ -86,6 +86,8 @@
+     int video_sync;
+ 
+     struct m_geometry android_surface_size;
++
++    struct m_geometry moltenvk_surface_size;
+ 
+     struct m_geometry d3d11_composition_size;
+ 
+diff --git forkSrcPrefix/player/command.c forkDstPrefix/player/command.c
+--- forkSrcPrefix/player/command.c
++++ forkDstPrefix/player/command.c
+@@ -8017,7 +8017,8 @@
+             queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
+     }
+ 
+-    if (opt_ptr == &opts->vo->android_surface_size || opt_ptr == &opts->vo->d3d11_composition_size) {
++    if (opt_ptr == &opts->vo->android_surface_size || opt_ptr == &opts->vo->d3d11_composition_size ||
++        opt_ptr == &opts->vo->moltenvk_surface_size) {
+         if (mpctx->video_out)
+             vo_control(mpctx->video_out, VOCTRL_EXTERNAL_RESIZE, NULL);
+     }
+diff --git forkSrcPrefix/video/out/vulkan/context_moltenvk.m forkDstPrefix/video/out/vulkan/context_moltenvk.m
+--- forkSrcPrefix/video/out/vulkan/context_moltenvk.m
++++ forkDstPrefix/video/out/vulkan/context_moltenvk.m
+@@ -22,6 +22,7 @@
+ #include "common.h"
+ #include "context.h"
+ #include "utils.h"
++#include "options/options.h"
+ 
+ struct priv {
+     struct mpvk_ctx vk;
+@@ -76,8 +77,20 @@
+ static bool moltenvk_reconfig(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
++    // The layer belongs to the client, and nothing here hears about its layout:
++    // a rotated or resized layer kept the swapchain, and the picture, at the
++    // size of the first configure. The client reports the layer's new size in
++    // pixels through --moltenvk-surface-size, which arrives as
++    // VOCTRL_EXTERNAL_RESIZE and lands here (as --android-surface-size does
++    // for the Android contexts). Until it has, the layer's own drawable size.
+     CGSize s = p->layer.drawableSize;
+-    ra_vk_ctx_resize(ctx, s.width, s.height);
++    int w = ctx->vo->opts->moltenvk_surface_size.w;
++    int h = ctx->vo->opts->moltenvk_surface_size.h;
++    if (w <= 0)
++        w = s.width;
++    if (h <= 0)
++        h = s.height;
++    ra_vk_ctx_resize(ctx, w, h);
+     return true;
+ }
+ 
