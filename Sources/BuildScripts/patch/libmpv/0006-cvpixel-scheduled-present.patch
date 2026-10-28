@@ -1,0 +1,141 @@
+diff --git forkSrcPrefix/include/mpv/cvpixel.h forkDstPrefix/include/mpv/cvpixel.h
+index 822b2d2..da59544 100644
+--- forkSrcPrefix/include/mpv/cvpixel.h
++++ forkDstPrefix/include/mpv/cvpixel.h
+@@ -79,6 +79,20 @@ typedef struct mpv_cvpixel_color {
+     float white[2];
+ } mpv_cvpixel_color;
+ 
++/**
++ * When a presented buffer is due on the display. mpv's playloop hands the
++ * output each frame ahead of its target time (--video-timing-offset, 50 ms by
++ * default) and the frame is rendered at once, so the buffer reaches the client
++ * before it is due: the client schedules it for that moment (an
++ * AVSampleBufferDisplayLayer presents a buffer at its timestamp, on the
++ * display's own refresh) instead of showing it as soon as it arrives, which
++ * would land it on whichever refresh follows the render.
++ */
++typedef struct mpv_cvpixel_timing {
++    int64_t due_in_ns;   // nanoseconds from the moment of the call until the frame is due; <= 0 means show it as soon as possible (a redraw, or a frame that is already late)
++    double duration_ns;  // the frame's nominal display duration; < 0 when unknown
++} mpv_cvpixel_timing;
++
+ /**
+  * The client's side of the sink. Every field except `flush` and `size` is
+  * required.
+@@ -105,10 +119,12 @@ typedef struct mpv_cvpixel_sink {
+     /**
+      * The frame has been rendered and the GPU work has completed. Ownership of
+      * `buffer` (the +1 from acquire) passes to the client, which must release
+-     * it when done. `color` describes the encoding.
++     * it when done. `color` describes the encoding; `timing` says when the
++     * frame is due (NULL: as soon as possible).
+      */
+     void (*present)(void *user_data, CVPixelBufferRef buffer,
+-                    const mpv_cvpixel_color *color);
++                    const mpv_cvpixel_color *color,
++                    const mpv_cvpixel_timing *timing);
+ 
+     /**
+      * Playback was reset (seek, new file, stop): drop any frames the client
+diff --git forkSrcPrefix/video/out/vo_gpu_next.c forkDstPrefix/video/out/vo_gpu_next.c
+index 30e493f..52d6808 100644
+--- forkSrcPrefix/video/out/vo_gpu_next.c
++++ forkDstPrefix/video/out/vo_gpu_next.c
+@@ -36,6 +36,7 @@
+ #include "options/path.h"
+ #include "osdep/io.h"
+ #include "osdep/threads.h"
++#include "osdep/timer.h"
+ #include "stream/stream.h"
+ #include "sub/draw_bmp.h"
+ #include "video/fmt-conversion.h"
+@@ -1474,6 +1475,20 @@ done:
+ 
+     pl_gpu_flush(gpu);
+     p->frame_pending = true;
++#if HAVE_MOLTENVK
++    if (p->cvpixel) {
++        // Hand the frame over now, with when it is due, rather than from
++        // flip_page: vo.c sleeps until the target time between the two, and a
++        // frame presented only then lands on whichever display refresh follows,
++        // phase-locked to nothing. A redraw carries no pts and is due at once.
++        struct mpv_cvpixel_timing timing = {
++            .due_in_ns = frame->pts > 0 ? frame->pts - mp_time_ns() : 0,
++            .duration_ns = frame->duration,
++        };
++        ra_cvpixel_submit_frame(p->ra_ctx, &timing);
++        p->frame_pending = false;
++    }
++#endif
+     return VO_TRUE;
+ }
+ 
+@@ -1485,7 +1500,7 @@ static void flip_page(struct vo *vo)
+     if (p->frame_pending) {
+ #if HAVE_MOLTENVK
+         if (p->cvpixel) {
+-            ra_cvpixel_submit_frame(p->ra_ctx);
++            ra_cvpixel_submit_frame(p->ra_ctx, NULL);   // not reached: draw_frame submits; kept so a pending frame can never be stranded
+         } else
+ #endif
+         if (!pl_swapchain_submit_frame(p->sw)) {
+diff --git forkSrcPrefix/video/out/vulkan/context_cvpixel.h forkDstPrefix/video/out/vulkan/context_cvpixel.h
+index 8d531d6..d592415 100644
+--- forkSrcPrefix/video/out/vulkan/context_cvpixel.h
++++ forkDstPrefix/video/out/vulkan/context_cvpixel.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <libplacebo/renderer.h>
++#include "mpv/cvpixel.h"
+ #include "video/out/gpu/context.h"
+ 
+ // The "cvpixel" gpu-context (Apple only): headless Vulkan (MoltenVK) whose
+@@ -15,8 +16,10 @@ bool ra_cvpixel_ctx_is(struct ra_ctx *ctx);
+ bool ra_cvpixel_start_frame(struct ra_ctx *ctx, const struct pl_color_space *csp,
+                             struct pl_swapchain_frame *out_frame);
+ 
+-// Wait for the GPU, hand the buffer to the sink, release the wrapper.
+-void ra_cvpixel_submit_frame(struct ra_ctx *ctx);
++// Wait for the GPU, hand the buffer to the sink with when it is due, release
++// the wrapper. Called from draw_frame, before vo.c's wait for the target time,
++// so the client has the frame ahead of its due moment.
++void ra_cvpixel_submit_frame(struct ra_ctx *ctx, const mpv_cvpixel_timing *timing);
+ 
+ // Drop an unsubmitted frame and tell the sink to flush.
+ void ra_cvpixel_flush(struct ra_ctx *ctx);
+diff --git forkSrcPrefix/video/out/vulkan/context_cvpixel.m forkDstPrefix/video/out/vulkan/context_cvpixel.m
+index a7c0e18..937f298 100644
+--- forkSrcPrefix/video/out/vulkan/context_cvpixel.m
++++ forkDstPrefix/video/out/vulkan/context_cvpixel.m
+@@ -268,15 +268,17 @@ static void fill_color(mpv_cvpixel_color *out, const struct pl_color_space *csp)
+     out->white[0] = csp->hdr.prim.white.x; out->white[1] = csp->hdr.prim.white.y;
+ }
+ 
+-void ra_cvpixel_submit_frame(struct ra_ctx *ctx)
++void ra_cvpixel_submit_frame(struct ra_ctx *ctx, const mpv_cvpixel_timing *timing)
+ {
+     struct priv *p = ctx->priv;
+     if (!p->pbuf)
+         return;
+ 
+     // Rendering into an imported Metal texture: make sure the GPU is done
+-    // before AVFoundation samples it. A shared event would avoid the stall;
+-    // first version keeps it simple.
++    // before AVFoundation samples it. The wait is off the display's critical
++    // path now that the frame is submitted ahead of its due time (the VO
++    // thread would otherwise sleep until that time anyway); a fence would
++    // only matter once a render approached the frame interval.
+     pl_gpu_finish(p->vk.gpu);
+ 
+     mpv_cvpixel_color color;
+@@ -288,7 +290,7 @@ void ra_cvpixel_submit_frame(struct ra_ctx *ctx)
+     CFRelease(p->mtltex);
+     p->mtltex = NULL;
+ 
+-    p->sink->present(p->sink->user_data, buf, &color);
++    p->sink->present(p->sink->user_data, buf, &color, timing);
+     CVMetalTextureCacheFlush(p->cache, 0);
+ }
+ 
