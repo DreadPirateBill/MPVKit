@@ -1,0 +1,37 @@
+diff --git forkSrcPrefix/video/out/vo_gpu_next.c forkDstPrefix/video/out/vo_gpu_next.c
+index fa8591d..12e5b1b 100644
+--- forkSrcPrefix/video/out/vo_gpu_next.c
++++ forkDstPrefix/video/out/vo_gpu_next.c
+@@ -37,6 +37,11 @@
+ #include "osdep/io.h"
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
++
++// How far ahead of a frame's target the cvpixel sink is handed it (patch
++// 0008): the player then accepts the next frame this much earlier, as it does
++// for vdpau's presentation queue, which presents by timestamp the same way.
++#define CVPIXEL_FLIP_QUEUE_MS 50
+ #include "stream/stream.h"
+ #include "sub/draw_bmp.h"
+ #include "video/fmt-conversion.h"
+@@ -2586,7 +2591,19 @@ static void update_render_options(struct vo *vo)
+         req_frames += ceilf(pars->params.frame_mixer->kernel->radius) *
+                       (pars->params.skip_anti_aliasing ? 1 : 2);
+     }
+-    vo_set_queue_params(vo, 0, MPMIN(VO_MAX_REQ_FRAMES, req_frames));
++    // A swapchain gains nothing from an earlier flip, so the queue offset is 0:
++    // the next frame is accepted only once the current one has flipped at its
++    // target, and its whole window is one frame interval. The cvpixel sink
++    // presents by timestamp and the render (with its GPU finish) sits on this
++    // thread, so declare the offset vdpau's presentation queue declares: the
++    // flip comes that much before the target and the next frame that much
++    // earlier, leaving the sink a lead of about an interval plus the headroom.
++    int64_t flip_offset = 0;
++#if HAVE_MOLTENVK
++    if (p->cvpixel)
++        flip_offset = MP_TIME_MS_TO_NS(CVPIXEL_FLIP_QUEUE_MS);
++#endif
++    vo_set_queue_params(vo, flip_offset, MPMIN(VO_MAX_REQ_FRAMES, req_frames));
+ 
+     pars->params.deband_params = opts->deband ? &pars->deband_params : NULL;
+     pars->deband_params.iterations = opts->deband_opts->iterations;
