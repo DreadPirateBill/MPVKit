@@ -1,0 +1,655 @@
+diff --git forkSrcPrefix/include/mpv/cvpixel.h forkDstPrefix/include/mpv/cvpixel.h
+index da59544..27537f8 100644
+--- forkSrcPrefix/include/mpv/cvpixel.h
++++ forkDstPrefix/include/mpv/cvpixel.h
+@@ -35,9 +35,12 @@
+  *     the source's colour space (PQ / HLG, BT.2020); leave it "no" for SDR
+  *     BT.709 frames with libplacebo tone-mapping
+  *
+- * All callbacks are invoked on mpv's VO thread and must not call back into
+- * libmpv. Buffers are IOSurface-backed kCVPixelFormatType_64RGBAHalf, full
+- * range RGB, encoded per `mpv_cvpixel_color`.
++ * `size`, `acquire` and `flush` are invoked on mpv's VO thread; `present` on
++ * mpv's present thread, once the GPU has finished the frame (the VO thread
++ * does not wait for it). No callback may call back into libmpv. Buffers are
++ * IOSurface-backed, full-range RGB, encoded per `mpv_cvpixel_color`:
++ * kCVPixelFormatType_64RGBAHalf for HDR frames (PQ / HLG),
++ * kCVPixelFormatType_ARGB2101010LEPacked (10-bit) for SDR frames.
+  */
+ 
+ #include <stdint.h>
+@@ -109,18 +112,19 @@ typedef struct mpv_cvpixel_sink {
+ 
+     /**
+      * Provide a buffer for one frame: exactly width x height, IOSurface-backed,
+-     * of the given pixel format (currently always kCVPixelFormatType_64RGBAHalf).
+-     * Return it with a +1 retain; mpv releases its reference after `present`.
+-     * Returning NULL skips the frame.
++     * of the given pixel format (kCVPixelFormatType_64RGBAHalf for an HDR
++     * frame, kCVPixelFormatType_ARGB2101010LEPacked for an SDR one; a session
++     * may ask for both). Return it with a +1 retain; mpv releases its
++     * reference after `present`. Returning NULL skips the frame.
+      */
+     CVPixelBufferRef (*acquire)(void *user_data, int width, int height,
+                                 uint32_t pixel_format);
+ 
+     /**
+-     * The frame has been rendered and the GPU work has completed. Ownership of
+-     * `buffer` (the +1 from acquire) passes to the client, which must release
+-     * it when done. `color` describes the encoding; `timing` says when the
+-     * frame is due (NULL: as soon as possible).
++     * The frame has been rendered and the GPU work has completed; called on
++     * mpv's present thread. Ownership of `buffer` (the +1 from acquire) passes
++     * to the client, which must release it when done. `color` describes the
++     * encoding; `timing` says when the frame is due (NULL: as soon as possible).
+      */
+     void (*present)(void *user_data, CVPixelBufferRef buffer,
+                     const mpv_cvpixel_color *color,
+diff --git forkSrcPrefix/video/out/vo_gpu_next.c forkDstPrefix/video/out/vo_gpu_next.c
+index 12e5b1b..e4ebc7e 100644
+--- forkSrcPrefix/video/out/vo_gpu_next.c
++++ forkDstPrefix/video/out/vo_gpu_next.c
+@@ -1486,7 +1486,8 @@ done:
+         // flip_page: vo.c sleeps until the target time between the two, and a
+         // frame presented only then lands on whichever display refresh follows,
+         // phase-locked to nothing. A redraw carries no pts and is due at once.
+-        // The context measures the lead itself, after its GPU finish.
++        // The context queues the frame and returns; its present thread hands
++        // the buffer over when the GPU is done, measuring the lead then.
+         ra_cvpixel_submit_frame(p->ra_ctx, frame->pts, frame->duration);
+         p->frame_pending = false;
+     }
+@@ -2594,10 +2595,10 @@ static void update_render_options(struct vo *vo)
+     // A swapchain gains nothing from an earlier flip, so the queue offset is 0:
+     // the next frame is accepted only once the current one has flipped at its
+     // target, and its whole window is one frame interval. The cvpixel sink
+-    // presents by timestamp and the render (with its GPU finish) sits on this
+-    // thread, so declare the offset vdpau's presentation queue declares: the
+-    // flip comes that much before the target and the next frame that much
+-    // earlier, leaving the sink a lead of about an interval plus the headroom.
++    // presents by timestamp and hands the frame over only when the GPU has
++    // finished it, so declare the offset vdpau's presentation queue declares:
++    // the flip comes that much before the target and the next frame that much
++    // earlier, leaving the render that much more time ahead of the due moment.
+     int64_t flip_offset = 0;
+ #if HAVE_MOLTENVK
+     if (p->cvpixel)
+diff --git forkSrcPrefix/video/out/vulkan/context_cvpixel.h forkDstPrefix/video/out/vulkan/context_cvpixel.h
+index ba5d03d..6c60762 100644
+--- forkSrcPrefix/video/out/vulkan/context_cvpixel.h
++++ forkDstPrefix/video/out/vulkan/context_cvpixel.h
+@@ -12,17 +12,18 @@
+ bool ra_cvpixel_ctx_is(struct ra_ctx *ctx);
+ 
+ // Acquire a buffer from the sink and wrap it as a render target encoded in
+-// `csp`. On success fills `out_frame` (single RGBA16F plane, full-range RGB).
++// `csp`. On success fills `out_frame`: a single full-range RGB plane, RGBA16F
++// for an HDR `csp` (PQ / HLG), 10-bit BGR10A2 otherwise.
+ bool ra_cvpixel_start_frame(struct ra_ctx *ctx, const struct pl_color_space *csp,
+                             struct pl_swapchain_frame *out_frame);
+ 
+-// Wait for the GPU, hand the buffer to the sink with when it is due, release
+-// the wrapper. Called from draw_frame, before vo.c's wait for the target time,
+-// so the client has the frame ahead of its due moment.
++// Queue the started frame for the sink: the GPU signals when its render is
++// done and the present thread hands the buffer over then, with the lead
++// measured at that moment. Returns without waiting. Called from draw_frame.
+ // due_at_ns: when the frame is due on mp_time (0 = as soon as possible, a redraw);
+-// duration_ns: its nominal display duration (< 0 unknown). The lead handed to the
+-// sink is measured inside, after the GPU finish, so it is current at the call.
++// duration_ns: its nominal display duration (< 0 unknown).
+ void ra_cvpixel_submit_frame(struct ra_ctx *ctx, int64_t due_at_ns, double duration_ns);
+ 
+-// Drop an unsubmitted frame and tell the sink to flush.
++// Drop an unsubmitted frame, discard the frames still rendering, and tell the
++// sink to flush.
+ void ra_cvpixel_flush(struct ra_ctx *ctx);
+diff --git forkSrcPrefix/video/out/vulkan/context_cvpixel.m forkDstPrefix/video/out/vulkan/context_cvpixel.m
+index b1dfd34..04ab3a7 100644
+--- forkSrcPrefix/video/out/vulkan/context_cvpixel.m
++++ forkDstPrefix/video/out/vulkan/context_cvpixel.m
+@@ -21,6 +21,27 @@
+ // mapping, Dolby Vision reshaping, OSD), and the finished buffer goes back to
+ // the client for AVFoundation to display. Companion to context_moltenvk.m,
+ // which presents to a CAMetalLayer instead.
++//
++// Hand-over (patch 0009): the VO thread never waits for the GPU. After the
++// render is recorded, the target is "held" (pl_vulkan_hold_ex), which submits
++// the pending commands and signals a timeline semaphore when the GPU is done
++// with the image; the frame joins a small queue and the VO thread returns to
++// the player at once, as it does with a swapchain. A present thread waits on
++// the semaphore for each queued frame in order and only then hands the buffer
++// to the sink, with the lead measured at that moment. The earlier per-frame
++// pl_gpu_finish on the VO thread (patch 0004) made the render time part of the
++// player's own timing: a render near the frame interval left the next frame
++// accepted late, and the drop counters saw nothing (docs/mpv-hdr-player-plan.md
++// §25). The queue is bounded, so a GPU that falls behind holds the VO thread
++// at submit instead of growing the pool. Should the GPU be unable to provide
++// the signal (no thread-safe pl_gpu, no vkWaitSemaphores), the context falls
++// back to the synchronous finish.
++//
++// Targets: HDR frames (PQ / HLG) render into RGBA16F; SDR frames into 10-bit
++// BGR10A2 (kCVPixelFormatType_ARGB2101010LEPacked), half the bytes per pixel
++// for the render to write and the display to read, with libplacebo dithering
++// to the 10-bit depth. The first failure to import a 10-bit buffer puts SDR
++// back on RGBA16F for the rest of the session.
+ 
+ #include <CoreVideo/CoreVideo.h>
+ #include <Metal/Metal.h>
+@@ -28,23 +49,68 @@
+ #include <libplacebo/vulkan.h>
+ 
+ #include "mpv/cvpixel.h"
++#include "osdep/threads.h"
+ #include "osdep/timer.h"
+ #include "common.h"
+ #include "context.h"
+ #include "context_cvpixel.h"
+ #include "utils.h"
+ 
++// Frames rendered but not yet handed to the sink. At 24 fps with a 35 ms
++// render one is in flight; the bound only matters when the GPU falls behind.
++#define MAX_PENDING 4
++
++// How long the present thread waits for a render before giving the frame up.
++#define RENDER_TIMEOUT_NS MP_TIME_S_TO_NS(2)
++
++struct target_format {
++    uint32_t cv;            // the CVPixelBuffer pixel format the sink supplies
++    MTLPixelFormat mtl;     // the Metal view of it
++    pl_fmt fmt;             // the libplacebo format libplacebo renders into
++    int depth;              // bits per component the renderer dithers to
++};
++
++// A frame between submit and present: the buffer, its texture wrapper, what
++// the sink needs to know, and the timeline value that fires when its render
++// has completed on the GPU.
++struct pending {
++    CVPixelBufferRef pbuf;
++    CVMetalTextureRef mtltex;
++    pl_tex tex;
++    mpv_cvpixel_color color;
++    int64_t due_at_ns;
++    double duration_ns;
++    uint64_t serial;
++    bool discard;           // flushed while in flight: release it, do not present
++};
++
+ struct priv {
+     struct mpvk_ctx vk;
+     mpv_cvpixel_sink *sink;
+     CVMetalTextureCacheRef cache;
+-    pl_fmt fmt;
++    struct target_format fmt_hdr;   // RGBA16F
++    struct target_format fmt_sdr;   // BGR10A2, or RGBA16F when unavailable
++    bool sdr_10bit;                 // fmt_sdr is the 10-bit target (cleared on the first import failure)
+ 
+     // The frame between start_frame and submit_frame
+     CVPixelBufferRef pbuf;
+     CVMetalTextureRef mtltex;
+     pl_tex tex;
+     struct pl_color_space csp;
++
++    // Asynchronous hand-over (see the header comment)
++    bool async;                     // false: synchronous finish and present on the VO thread
++    VkSemaphore done_sem;           // timeline; the value reaches a frame's serial when its render is done
++    uint64_t serial;                // the last serial handed out
++    PFN_vkWaitSemaphores wait_semaphores;
++    mp_thread present_thread;
++    bool thread_started;
++    mp_mutex lock;                  // guards the queue and `quit`
++    mp_cond cond;                   // a frame queued, a slot freed, or quit
++    struct pending queue[MAX_PENDING];
++    int queue_head;
++    int queue_len;
++    bool quit;
+ };
+ 
+ // The Metal device MoltenVK is using, so the texture cache creates textures on
+@@ -89,12 +155,125 @@ static void drop_frame(struct priv *p)
+     }
+ }
+ 
++static void fill_color(mpv_cvpixel_color *out, const struct pl_color_space *csp)
++{
++    *out = (mpv_cvpixel_color) {0};
++    switch (csp->primaries) {
++    case PL_COLOR_PRIM_BT_709:    out->primaries = MPV_CVPIXEL_PRIM_BT709;  break;
++    case PL_COLOR_PRIM_BT_2020:   out->primaries = MPV_CVPIXEL_PRIM_BT2020; break;
++    case PL_COLOR_PRIM_DCI_P3:
++    case PL_COLOR_PRIM_DISPLAY_P3: out->primaries = MPV_CVPIXEL_PRIM_P3;    break;
++    default:                      out->primaries = MPV_CVPIXEL_PRIM_UNKNOWN; break;
++    }
++    switch (csp->transfer) {
++    case PL_COLOR_TRC_PQ:   out->transfer = MPV_CVPIXEL_TRC_PQ;   break;
++    case PL_COLOR_TRC_HLG:  out->transfer = MPV_CVPIXEL_TRC_HLG;  break;
++    case PL_COLOR_TRC_SRGB: out->transfer = MPV_CVPIXEL_TRC_SRGB; break;
++    default:                out->transfer = MPV_CVPIXEL_TRC_UNKNOWN; break;
++    }
++    out->min_luma = csp->hdr.min_luma;
++    out->max_luma = csp->hdr.max_luma;
++    out->max_cll  = csp->hdr.max_cll;
++    out->max_fall = csp->hdr.max_fall;
++    out->red[0]   = csp->hdr.prim.red.x;   out->red[1]   = csp->hdr.prim.red.y;
++    out->green[0] = csp->hdr.prim.green.x; out->green[1] = csp->hdr.prim.green.y;
++    out->blue[0]  = csp->hdr.prim.blue.x;  out->blue[1]  = csp->hdr.prim.blue.y;
++    out->white[0] = csp->hdr.prim.white.x; out->white[1] = csp->hdr.prim.white.y;
++}
++
++// Hand a finished buffer to the sink with when it is due, measured now: the
++// sink adds the lead to its own clock at the moment of the call.
++static void present_now(struct priv *p, CVPixelBufferRef buf, const mpv_cvpixel_color *color,
++                        int64_t due_at_ns, double duration_ns)
++{
++    mpv_cvpixel_timing timing = {
++        .due_in_ns = due_at_ns > 0 ? due_at_ns - mp_time_ns() : 0,
++        .duration_ns = duration_ns,
++    };
++    p->sink->present(p->sink->user_data, buf, color, &timing);   // the +1 from acquire passes to the sink
++}
++
++// The present thread: for each queued frame, in order, wait for its render to
++// complete on the GPU, then present it (or release it, if flushed meanwhile)
++// and free its texture wrapper. Runs until told to quit AND the queue is empty,
++// so every frame in flight at teardown is waited for and released.
++static MP_THREAD_VOID present_thread(void *arg)
++{
++    struct ra_ctx *ctx = arg;
++    struct priv *p = ctx->priv;
++    mp_thread_set_name("cvpixel/present");
++
++    while (1) {
++        mp_mutex_lock(&p->lock);
++        while (!p->queue_len && !p->quit)
++            mp_cond_wait(&p->cond, &p->lock);
++        if (!p->queue_len) {
++            mp_mutex_unlock(&p->lock);
++            break;
++        }
++        struct pending f = p->queue[p->queue_head];
++        mp_mutex_unlock(&p->lock);
++
++        VkSemaphoreWaitInfo wait = {
++            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
++            .semaphoreCount = 1,
++            .pSemaphores = &p->done_sem,
++            .pValues = &f.serial,
++        };
++        VkResult res = p->wait_semaphores(p->vk.vulkan->device, &wait, RENDER_TIMEOUT_NS);
++
++        mp_mutex_lock(&p->lock);
++        bool discard = p->queue[p->queue_head].discard;   // a flush may have marked it during the wait
++        p->queue_head = (p->queue_head + 1) % MAX_PENDING;
++        p->queue_len--;
++        mp_cond_broadcast(&p->cond);   // a submit may be waiting for the slot
++        mp_mutex_unlock(&p->lock);
++
++        if (res != VK_SUCCESS) {
++            MP_WARN(ctx, "Render of frame %llu not complete after %d ms (%d); dropping it\n",
++                    (unsigned long long)f.serial, (int)(RENDER_TIMEOUT_NS / 1000000), (int)res);
++            discard = true;
++        }
++        if (discard) {
++            CVPixelBufferRelease(f.pbuf);
++        } else {
++            present_now(p, f.pbuf, &f.color, f.due_at_ns, f.duration_ns);
++        }
++        pl_tex_destroy(p->vk.gpu, &f.tex);
++        CFRelease(f.mtltex);
++        CVMetalTextureCacheFlush(p->cache, 0);
++    }
++    MP_THREAD_RETURN();
++}
++
++static void stop_present_thread(struct priv *p)
++{
++    if (!p->thread_started)
++        return;
++    mp_mutex_lock(&p->lock);
++    p->quit = true;
++    mp_cond_broadcast(&p->cond);
++    mp_mutex_unlock(&p->lock);
++    mp_thread_join(p->present_thread);
++    p->thread_started = false;
++}
++
+ static void cvpixel_uninit(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+     if (!p)
+         return;
+     drop_frame(p);
++    stop_present_thread(p);
++    if (p->vk.gpu && p->done_sem) {
++        pl_gpu_finish(p->vk.gpu);   // nothing may still depend on the semaphore when it goes
++        pl_vulkan_sem_destroy(p->vk.gpu, &p->done_sem);
++    }
++    if (p->async) {
++        mp_cond_destroy(&p->cond);
++        mp_mutex_destroy(&p->lock);
++        p->async = false;
++    }
+     if (p->cache) {
+         CFRelease(p->cache);
+         p->cache = NULL;
+@@ -103,6 +282,51 @@ static void cvpixel_uninit(struct ra_ctx *ctx)
+     mpvk_uninit(&p->vk);
+ }
+ 
++// Set up the completion signal and the present thread; on any failure the
++// context keeps the synchronous hand-over.
++static void init_async(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    pl_gpu gpu = p->vk.gpu;
++    pl_vulkan vulkan = p->vk.vulkan;
++
++    if (!gpu->limits.thread_safe) {
++        MP_WARN(ctx, "pl_gpu is not thread-safe; presenting synchronously\n");
++        return;
++    }
++    p->wait_semaphores = (PFN_vkWaitSemaphores)
++        vulkan->get_proc_addr(vulkan->instance, "vkWaitSemaphores");
++    if (!p->wait_semaphores) {
++        p->wait_semaphores = (PFN_vkWaitSemaphores)
++            vulkan->get_proc_addr(vulkan->instance, "vkWaitSemaphoresKHR");
++    }
++    if (!p->wait_semaphores) {
++        MP_WARN(ctx, "vkWaitSemaphores unavailable; presenting synchronously\n");
++        return;
++    }
++    p->done_sem = pl_vulkan_sem_create(gpu, pl_vulkan_sem_params(
++        .type = VK_SEMAPHORE_TYPE_TIMELINE,
++        .initial_value = 0,
++    ));
++    if (!p->done_sem) {
++        MP_WARN(ctx, "No timeline semaphore; presenting synchronously\n");
++        return;
++    }
++    mp_mutex_init(&p->lock);
++    mp_cond_init(&p->cond);
++    p->async = true;
++    if (mp_thread_create(&p->present_thread, present_thread, ctx)) {
++        MP_WARN(ctx, "Could not start the present thread; presenting synchronously\n");
++        mp_cond_destroy(&p->cond);
++        mp_mutex_destroy(&p->lock);
++        p->async = false;
++        pl_vulkan_sem_destroy(gpu, &p->done_sem);
++        return;
++    }
++    p->thread_started = true;
++    MP_VERBOSE(ctx, "Presenting from the render's completion\n");
++}
++
+ static bool cvpixel_init(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
+@@ -124,12 +348,32 @@ static bool cvpixel_init(struct ra_ctx *ctx)
+     if (!ra_vk_ctx_init_headless(ctx, vk, params))
+         goto fail;
+ 
+-    p->fmt = pl_find_fmt(vk->gpu, PL_FMT_FLOAT, 4, 16, 16,
+-                         PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_BLITTABLE);
+-    if (!p->fmt) {
++    const enum pl_fmt_caps caps = PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_BLITTABLE;
++    p->fmt_hdr = (struct target_format) {
++        .cv = kCVPixelFormatType_64RGBAHalf,
++        .mtl = MTLPixelFormatRGBA16Float,
++        .fmt = pl_find_fmt(vk->gpu, PL_FMT_FLOAT, 4, 16, 16, caps),
++        .depth = 16,
++    };
++    if (!p->fmt_hdr.fmt) {
+         MP_MSG(ctx, msgl, "No renderable RGBA16F format\n");
+         goto fail;
+     }
++    // VK_FORMAT_A2R10G10B10_UNORM_PACK32 is MTLPixelFormatBGR10A2Unorm is
++    // kCVPixelFormatType_ARGB2101010LEPacked: blue in the low bits, alpha in the top two.
++    pl_fmt fmt10 = pl_find_named_fmt(vk->gpu, "bgr10a2");
++    if (fmt10 && (fmt10->caps & caps) == caps) {
++        p->fmt_sdr = (struct target_format) {
++            .cv = kCVPixelFormatType_ARGB2101010LEPacked,
++            .mtl = MTLPixelFormatBGR10A2Unorm,
++            .fmt = fmt10,
++            .depth = 10,
++        };
++        p->sdr_10bit = true;
++    } else {
++        MP_VERBOSE(ctx, "No renderable 10-bit format; SDR renders into RGBA16F\n");
++        p->fmt_sdr = p->fmt_hdr;
++    }
+ 
+     id<MTLDevice> dev = mtl_device_for(vk->vulkan);
+     CVReturn err = CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, dev, NULL, &p->cache);
+@@ -139,6 +383,7 @@ static bool cvpixel_init(struct ra_ctx *ctx)
+         goto fail;
+     }
+ 
++    init_async(ctx);
+     return true;
+ 
+ fail:
+@@ -178,38 +423,30 @@ bool ra_cvpixel_ctx_is(struct ra_ctx *ctx)
+     return ctx && ctx->fns == &ra_ctx_vulkan_cvpixel;
+ }
+ 
+-bool ra_cvpixel_start_frame(struct ra_ctx *ctx, const struct pl_color_space *csp,
+-                            struct pl_swapchain_frame *out_frame)
++// Acquire a buffer of the target format from the sink and wrap it. Returns
++// false with nothing held when the sink has no buffer or the import fails.
++static bool acquire_target(struct ra_ctx *ctx, const struct target_format *tf, int w, int h)
+ {
+     struct priv *p = ctx->priv;
+-    pl_gpu gpu = p->vk.gpu;
+ 
+-    drop_frame(p);   // a frame that was started but never submitted
+-
+-    int w = ctx->vo->dwidth, h = ctx->vo->dheight;
+-    if (w <= 0 || h <= 0)
+-        return false;
+-
+-    CVPixelBufferRef buf = p->sink->acquire(p->sink->user_data, w, h,
+-                                            kCVPixelFormatType_64RGBAHalf);
++    CVPixelBufferRef buf = p->sink->acquire(p->sink->user_data, w, h, tf->cv);
+     if (!buf)
+         return false;
+ 
+     size_t bw = CVPixelBufferGetWidth(buf), bh = CVPixelBufferGetHeight(buf);
+     CVMetalTextureRef mtltex = NULL;
+     CVReturn err = CVMetalTextureCacheCreateTextureFromImage(
+-        kCFAllocatorDefault, p->cache, buf, NULL, MTLPixelFormatRGBA16Float,
+-        bw, bh, 0, &mtltex);
++        kCFAllocatorDefault, p->cache, buf, NULL, tf->mtl, bw, bh, 0, &mtltex);
+     if (err != noErr || !mtltex) {
+         MP_ERR(ctx, "CVMetalTextureCacheCreateTextureFromImage failed: %d\n", (int)err);
+         CVPixelBufferRelease(buf);
+         return false;
+     }
+ 
+-    pl_tex tex = pl_tex_create(gpu, &(struct pl_tex_params) {
++    pl_tex tex = pl_tex_create(p->vk.gpu, &(struct pl_tex_params) {
+         .w = bw,
+         .h = bh,
+-        .format = p->fmt,
++        .format = tf->fmt,
+         .renderable = true,
+         .blit_dst = true,
+         .import_handle = PL_HANDLE_MTL_TEX,
+@@ -227,85 +464,135 @@ bool ra_cvpixel_start_frame(struct ra_ctx *ctx, const struct pl_color_space *csp
+     p->pbuf = buf;
+     p->mtltex = mtltex;
+     p->tex = tex;
++    return true;
++}
++
++bool ra_cvpixel_start_frame(struct ra_ctx *ctx, const struct pl_color_space *csp,
++                            struct pl_swapchain_frame *out_frame)
++{
++    struct priv *p = ctx->priv;
++
++    drop_frame(p);   // a frame that was started but never submitted
++
++    int w = ctx->vo->dwidth, h = ctx->vo->dheight;
++    if (w <= 0 || h <= 0)
++        return false;
++
++    bool hdr = pl_color_transfer_is_hdr(csp->transfer);
++    const struct target_format *tf = hdr ? &p->fmt_hdr : &p->fmt_sdr;
++    if (!acquire_target(ctx, tf, w, h)) {
++        if (hdr || !p->sdr_10bit)
++            return false;
++        // The 10-bit target did not take on this device: SDR goes back to
++        // RGBA16F from here on, this frame included.
++        MP_WARN(ctx, "10-bit SDR target unavailable; SDR renders into RGBA16F\n");
++        p->sdr_10bit = false;
++        p->fmt_sdr = p->fmt_hdr;
++        tf = &p->fmt_sdr;
++        if (!acquire_target(ctx, tf, w, h))
++            return false;
++    }
+     p->csp = *csp;
+ 
+     *out_frame = (struct pl_swapchain_frame) {
+-        .fbo = tex,
++        .fbo = p->tex,
+         .flipped = false,
+         .color_repr = {
+             .sys = PL_COLOR_SYSTEM_RGB,
+             .levels = PL_COLOR_LEVELS_FULL,
+             .alpha = PL_ALPHA_UNKNOWN,
+-            .bits = { .sample_depth = 16, .color_depth = 16 },
++            .bits = { .sample_depth = tf->depth, .color_depth = tf->depth },
+         },
+         .color_space = *csp,
+     };
+     return true;
+ }
+ 
+-static void fill_color(mpv_cvpixel_color *out, const struct pl_color_space *csp)
++// Queue the started frame for the present thread: hold the target so
++// libplacebo submits its work and signals `done_sem` at the frame's serial.
++// Waits for a queue slot when the GPU is MAX_PENDING frames behind.
++static bool submit_async(struct ra_ctx *ctx, int64_t due_at_ns, double duration_ns)
+ {
+-    *out = (mpv_cvpixel_color) {0};
+-    switch (csp->primaries) {
+-    case PL_COLOR_PRIM_BT_709:    out->primaries = MPV_CVPIXEL_PRIM_BT709;  break;
+-    case PL_COLOR_PRIM_BT_2020:   out->primaries = MPV_CVPIXEL_PRIM_BT2020; break;
+-    case PL_COLOR_PRIM_DCI_P3:
+-    case PL_COLOR_PRIM_DISPLAY_P3: out->primaries = MPV_CVPIXEL_PRIM_P3;    break;
+-    default:                      out->primaries = MPV_CVPIXEL_PRIM_UNKNOWN; break;
+-    }
+-    switch (csp->transfer) {
+-    case PL_COLOR_TRC_PQ:   out->transfer = MPV_CVPIXEL_TRC_PQ;   break;
+-    case PL_COLOR_TRC_HLG:  out->transfer = MPV_CVPIXEL_TRC_HLG;  break;
+-    case PL_COLOR_TRC_SRGB: out->transfer = MPV_CVPIXEL_TRC_SRGB; break;
+-    default:                out->transfer = MPV_CVPIXEL_TRC_UNKNOWN; break;
+-    }
+-    out->min_luma = csp->hdr.min_luma;
+-    out->max_luma = csp->hdr.max_luma;
+-    out->max_cll  = csp->hdr.max_cll;
+-    out->max_fall = csp->hdr.max_fall;
+-    out->red[0]   = csp->hdr.prim.red.x;   out->red[1]   = csp->hdr.prim.red.y;
+-    out->green[0] = csp->hdr.prim.green.x; out->green[1] = csp->hdr.prim.green.y;
+-    out->blue[0]  = csp->hdr.prim.blue.x;  out->blue[1]  = csp->hdr.prim.blue.y;
+-    out->white[0] = csp->hdr.prim.white.x; out->white[1] = csp->hdr.prim.white.y;
++    struct priv *p = ctx->priv;
++    uint64_t serial = p->serial + 1;
++    VkImageLayout layout;   // kept as it is: an imported Metal texture has no layout to speak of
++    bool held = pl_vulkan_hold_ex(p->vk.gpu, pl_vulkan_hold_params(
++        .tex = p->tex,
++        .out_layout = &layout,
++        .qf = VK_QUEUE_FAMILY_IGNORED,
++        .semaphore = { .sem = p->done_sem, .value = serial },
++    ));
++    if (!held)
++        return false;
++    p->serial = serial;
++    pl_gpu_flush(p->vk.gpu);   // the hold submits; this is belt and braces
++
++    struct pending f = {
++        .pbuf = p->pbuf,
++        .mtltex = p->mtltex,
++        .tex = p->tex,
++        .due_at_ns = due_at_ns,
++        .duration_ns = duration_ns,
++        .serial = serial,
++    };
++    fill_color(&f.color, &p->csp);
++    p->pbuf = NULL;
++    p->mtltex = NULL;
++    p->tex = NULL;
++
++    // Submit and uninit both run on the VO thread, so the thread is never
++    // quitting here; only a full queue holds this up.
++    mp_mutex_lock(&p->lock);
++    while (p->queue_len == MAX_PENDING)
++        mp_cond_wait(&p->cond, &p->lock);
++    p->queue[(p->queue_head + p->queue_len) % MAX_PENDING] = f;
++    p->queue_len++;
++    mp_cond_broadcast(&p->cond);
++    mp_mutex_unlock(&p->lock);
++    return true;
+ }
+ 
+-void ra_cvpixel_submit_frame(struct ra_ctx *ctx, int64_t due_at_ns, double duration_ns)
++// The synchronous hand-over: wait for the GPU here, present from this thread.
++static void submit_sync(struct ra_ctx *ctx, int64_t due_at_ns, double duration_ns)
+ {
+     struct priv *p = ctx->priv;
+-    if (!p->pbuf)
+-        return;
+-
+-    // Rendering into an imported Metal texture: make sure the GPU is done
+-    // before AVFoundation samples it. The wait is off the display's critical
+-    // path now that the frame is submitted ahead of its due time (the VO
+-    // thread would otherwise sleep until that time anyway); a fence would
+-    // only matter once a render approached the frame interval.
+     pl_gpu_finish(p->vk.gpu);
+ 
+     mpv_cvpixel_color color;
+     fill_color(&color, &p->csp);
+ 
+-    CVPixelBufferRef buf = p->pbuf;   // the +1 from acquire passes to the sink
++    CVPixelBufferRef buf = p->pbuf;
+     p->pbuf = NULL;
+     pl_tex_destroy(p->vk.gpu, &p->tex);
+     CFRelease(p->mtltex);
+     p->mtltex = NULL;
+ 
+-    // Measured here, after the finish: the sink adds the lead to its own clock
+-    // at the moment of the call, so a lead taken before the wait would date
+-    // every frame late by its render time.
+-    mpv_cvpixel_timing timing = {
+-        .due_in_ns = due_at_ns > 0 ? due_at_ns - mp_time_ns() : 0,
+-        .duration_ns = duration_ns,
+-    };
+-    p->sink->present(p->sink->user_data, buf, &color, &timing);
++    present_now(p, buf, &color, due_at_ns, duration_ns);
+     CVMetalTextureCacheFlush(p->cache, 0);
+ }
+ 
++void ra_cvpixel_submit_frame(struct ra_ctx *ctx, int64_t due_at_ns, double duration_ns)
++{
++    struct priv *p = ctx->priv;
++    if (!p->pbuf)
++        return;
++    if (p->async && submit_async(ctx, due_at_ns, duration_ns))
++        return;
++    submit_sync(ctx, due_at_ns, duration_ns);
++}
++
+ void ra_cvpixel_flush(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+     drop_frame(p);
++    if (p->async) {
++        // Frames still rendering are from before the reset: the present
++        // thread releases them once the GPU is done instead of showing them.
++        mp_mutex_lock(&p->lock);
++        for (int i = 0; i < p->queue_len; i++)
++            p->queue[(p->queue_head + i) % MAX_PENDING].discard = true;
++        mp_mutex_unlock(&p->lock);
++    }
+     if (p->sink->flush)
+         p->sink->flush(p->sink->user_data);
+ }
