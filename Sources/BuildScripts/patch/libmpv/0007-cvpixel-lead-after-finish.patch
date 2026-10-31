@@ -1,0 +1,80 @@
+diff --git forkSrcPrefix/video/out/vo_gpu_next.c forkDstPrefix/video/out/vo_gpu_next.c
+index 52d6808..fa8591d 100644
+--- forkSrcPrefix/video/out/vo_gpu_next.c
++++ forkDstPrefix/video/out/vo_gpu_next.c
+@@ -1481,11 +1481,8 @@ done:
+         // flip_page: vo.c sleeps until the target time between the two, and a
+         // frame presented only then lands on whichever display refresh follows,
+         // phase-locked to nothing. A redraw carries no pts and is due at once.
+-        struct mpv_cvpixel_timing timing = {
+-            .due_in_ns = frame->pts > 0 ? frame->pts - mp_time_ns() : 0,
+-            .duration_ns = frame->duration,
+-        };
+-        ra_cvpixel_submit_frame(p->ra_ctx, &timing);
++        // The context measures the lead itself, after its GPU finish.
++        ra_cvpixel_submit_frame(p->ra_ctx, frame->pts, frame->duration);
+         p->frame_pending = false;
+     }
+ #endif
+@@ -1500,7 +1497,7 @@ static void flip_page(struct vo *vo)
+     if (p->frame_pending) {
+ #if HAVE_MOLTENVK
+         if (p->cvpixel) {
+-            ra_cvpixel_submit_frame(p->ra_ctx, NULL);   // not reached: draw_frame submits; kept so a pending frame can never be stranded
++            ra_cvpixel_submit_frame(p->ra_ctx, 0, -1);   // not reached: draw_frame submits; kept so a pending frame can never be stranded
+         } else
+ #endif
+         if (!pl_swapchain_submit_frame(p->sw)) {
+diff --git forkSrcPrefix/video/out/vulkan/context_cvpixel.h forkDstPrefix/video/out/vulkan/context_cvpixel.h
+index d592415..ba5d03d 100644
+--- forkSrcPrefix/video/out/vulkan/context_cvpixel.h
++++ forkDstPrefix/video/out/vulkan/context_cvpixel.h
+@@ -19,7 +19,10 @@ bool ra_cvpixel_start_frame(struct ra_ctx *ctx, const struct pl_color_space *csp
+ // Wait for the GPU, hand the buffer to the sink with when it is due, release
+ // the wrapper. Called from draw_frame, before vo.c's wait for the target time,
+ // so the client has the frame ahead of its due moment.
+-void ra_cvpixel_submit_frame(struct ra_ctx *ctx, const mpv_cvpixel_timing *timing);
++// due_at_ns: when the frame is due on mp_time (0 = as soon as possible, a redraw);
++// duration_ns: its nominal display duration (< 0 unknown). The lead handed to the
++// sink is measured inside, after the GPU finish, so it is current at the call.
++void ra_cvpixel_submit_frame(struct ra_ctx *ctx, int64_t due_at_ns, double duration_ns);
+ 
+ // Drop an unsubmitted frame and tell the sink to flush.
+ void ra_cvpixel_flush(struct ra_ctx *ctx);
+diff --git forkSrcPrefix/video/out/vulkan/context_cvpixel.m forkDstPrefix/video/out/vulkan/context_cvpixel.m
+index 937f298..b1dfd34 100644
+--- forkSrcPrefix/video/out/vulkan/context_cvpixel.m
++++ forkDstPrefix/video/out/vulkan/context_cvpixel.m
+@@ -28,6 +28,7 @@
+ #include <libplacebo/vulkan.h>
+ 
+ #include "mpv/cvpixel.h"
++#include "osdep/timer.h"
+ #include "common.h"
+ #include "context.h"
+ #include "context_cvpixel.h"
+@@ -268,7 +269,7 @@ static void fill_color(mpv_cvpixel_color *out, const struct pl_color_space *csp)
+     out->white[0] = csp->hdr.prim.white.x; out->white[1] = csp->hdr.prim.white.y;
+ }
+ 
+-void ra_cvpixel_submit_frame(struct ra_ctx *ctx, const mpv_cvpixel_timing *timing)
++void ra_cvpixel_submit_frame(struct ra_ctx *ctx, int64_t due_at_ns, double duration_ns)
+ {
+     struct priv *p = ctx->priv;
+     if (!p->pbuf)
+@@ -290,7 +291,14 @@ void ra_cvpixel_submit_frame(struct ra_ctx *ctx, const mpv_cvpixel_timing *timin
+     CFRelease(p->mtltex);
+     p->mtltex = NULL;
+ 
+-    p->sink->present(p->sink->user_data, buf, &color, timing);
++    // Measured here, after the finish: the sink adds the lead to its own clock
++    // at the moment of the call, so a lead taken before the wait would date
++    // every frame late by its render time.
++    mpv_cvpixel_timing timing = {
++        .due_in_ns = due_at_ns > 0 ? due_at_ns - mp_time_ns() : 0,
++        .duration_ns = duration_ns,
++    };
++    p->sink->present(p->sink->user_data, buf, &color, &timing);
+     CVMetalTextureCacheFlush(p->cache, 0);
+ }
+ 
