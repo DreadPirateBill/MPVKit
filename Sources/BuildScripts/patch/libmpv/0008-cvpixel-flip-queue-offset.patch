@@ -10,7 +10,7 @@ index fa8591d..12e5b1b 100644
 +// How far ahead of a frame's target the cvpixel sink is handed it (patch
 +// 0008): the player then accepts the next frame this much earlier, as it does
 +// for vdpau's presentation queue, which presents by timestamp the same way.
-+#define CVPIXEL_FLIP_QUEUE_MS 50
++#define CVPIXEL_FLIP_QUEUE_MS 70
  #include "stream/stream.h"
  #include "sub/draw_bmp.h"
  #include "video/fmt-conversion.h"
